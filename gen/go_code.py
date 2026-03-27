@@ -758,7 +758,7 @@ def update_completion() -> None:
         print('import "github.com/kovidgoyal/kitty/tools/cli"')
         print('func AddCloneSafeOpts(cmd *cli.Command) {')
         completion_for_launch_wrappers('cmd')
-        print(''.join(CompletionSpec.from_string('type:file mime:text/* group:"Text files"').as_go_code('cmd.ArgCompleter', ' = ')))
+        print(''.join(CompletionSpec.from_string('type:file mime:text/*,application/x-shellscript group:"Text files"').as_go_code('cmd.ArgCompleter', ' = ')))
         print('}')
 
 

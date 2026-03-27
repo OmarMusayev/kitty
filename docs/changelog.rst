@@ -168,6 +168,8 @@ Detailed list of changes
 0.47.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- edit-in-kitty: Fix tab completion not including :code:`.sh` files
+
 - For builtin key mappings automatically :ref:`fallback <mapping-fallback>` to matching the US-PC layout key when the pressed key has no matches and is a non-English character (:pull:`9671`)
 
 - :doc:`Remote control <remote-control>`: Expose :code:`session_name` in the output of ``kitten @ ls`` for each window (:iss:`9732`)
