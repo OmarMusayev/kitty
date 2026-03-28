@@ -1145,6 +1145,7 @@ class TabManager:  # {{{
     window_being_dropped: WindowBeingDropped | None = None
     window_drag_target_tab_id: int = 0
     window_drag_over_me: bool = False
+    new_tab_button_pressed: bool = False
 
     def __init__(self, os_window_id: int, args: CLIOptions, wm_class: str, wm_name: str, startup_session: SessionType | None = None):
         self.os_window_id = os_window_id
@@ -1752,8 +1753,12 @@ class TabManager:  # {{{
 
         tab_id_at_x = self.tab_bar.tab_id_at(int(x))
         if tab_id_at_x < 0:  # synthetic tab (e.g. "+" new-tab button)
-            if button == GLFW_MOUSE_BUTTON_LEFT and action == GLFW_RELEASE:
-                self.new_tab()
+            if button == GLFW_MOUSE_BUTTON_LEFT:
+                if action == GLFW_PRESS:
+                    self.new_tab_button_pressed = True
+                elif action == GLFW_RELEASE and self.new_tab_button_pressed:
+                    self.new_tab_button_pressed = False
+                    self.new_tab()
             return
         tab = self.tab_for_id(tab_id_at_x)
         now = monotonic()
@@ -1994,6 +1999,11 @@ class TabManager:  # {{{
         if w is None:
             return
         set_window_being_dragged()
+        if self.window_drag_over_me:
+            self.window_drag_over_me = False
+            if not self.tab_bar_hidden:
+                self.layout_tab_bar()
+                self.resize(only_tabs=True)
         self.mark_tab_bar_dirty()
         central, tab_bar = viewport_for_window(self.os_window_id)[:2]
 

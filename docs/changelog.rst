@@ -195,6 +195,8 @@ Detailed list of changes
 
 - Fix a spurious mouse button release event being sent when dragging out of an OS window causes focus loss
 
+- Fix dropping a window onto the "+" drop indicator in the tab bar creating an extra empty new tab in addition to the correct new tab
+
 - Fix scrollbar hover/interaction not working when the scrollbar is drawn in the window margin area (:iss:`9756`)
 
 - Fix completion for ``edit-in-kitty`` not including some common text file types
