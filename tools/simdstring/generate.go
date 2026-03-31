@@ -837,6 +837,73 @@ func (r Register) ARMId() uint32 {
 	return uint32(num)
 }
 
+// ARM64 NEON instruction encodings for instructions not available as named mnemonics
+// in the Go ARM64 assembler.
+
+func encode_uqsub16b(vm, vn, vd Register) uint32 {
+	// UQSUB Vd.16B, Vn.16B, Vm.16B: Vd = max(0, Vn - Vm) per byte
+	return 0x6E202C00 | (vm.ARMId()<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_bic16b(vn, vm, vd Register) uint32 {
+	// BIC Vd.16B, Vn.16B, Vm.16B: Vd = Vn & ~Vm
+	return 0x4E601C00 | (vm.ARMId()<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_bsl16b(vd, vn, vm Register) uint32 {
+	// BSL Vd.16B, Vn.16B, Vm.16B: result[i] = Vd[i].bit7 ? Vn[i] : Vm[i]; result in Vd
+	return 0x6E601C00 | (vm.ARMId()<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_ext16b(imm4 int, vn, vm, vd Register) uint32 {
+	// EXT Vd.16B, Vn.16B, Vm.16B, #imm4
+	// result[i] = Vm[imm4+i] for imm4+i<16, else Vn[imm4+i-16]
+	return 0x6E000000 | (vm.ARMId()<<16 | uint32(imm4)<<11 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_vadd16b(vn, vm, vd Register) uint32 {
+	// ADD Vd.16B, Vn.16B, Vm.16B: byte-wise add
+	return 0x4E208400 | (vm.ARMId()<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_shl8h(shift int, vn, vd Register) uint32 {
+	// SHL Vd.8H, Vn.8H, #shift: shift 16-bit elements left by constant
+	immhb := 16 + shift
+	return 0x4F005400 | (uint32(immhb)<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_ushr4s(shift int, vn, vd Register) uint32 {
+	// USHR Vd.4S, Vn.4S, #shift: logical right shift 32-bit elements by constant
+	// immhb = 64 - shift for .4S elements
+	immhb := 64 - shift
+	return 0x6F000400 | (uint32(immhb)<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_tbl16b(vn, vm, vd Register) uint32 {
+	// TBL Vd.16B, {Vn.16B}, Vm.16B: byte shuffle using Vm as indices into table Vn
+	// result[i] = Vn[Vm[i]] if Vm[i] < 16, else 0
+	return 0x4E002000 | (vm.ARMId()<<16 | vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_uaddlv16b(vn, vd Register) uint32 {
+	// UADDLV Hd, Vn.16B: unsigned sum of all 16 bytes into a 16-bit scalar in Vd.H0
+	return 0x2E303800 | (vn.ARMId()<<5 | vd.ARMId())
+}
+
+func encode_pmovzxbd128(vn, vd Register) uint32 {
+	// USHLL Vd.4S, Vn.8B, #0: zero-extend lower 4 bytes of Vn to 4 uint32s in Vd
+	// Encoding: 0x2F080400 | (Rn<<5) | Rd (immh=0b0001=1 for 8-bit->16-bit, then we need 16->32)
+	// Actually this is UXTL / USHLL2. Let's use two-step: USHLL (8b->4h), then USHLL (4h->4s)
+	// For simplicity, use UXTL which is alias for USHLL Vd.8H, Vn.8B, #0: 0x2F080400|(Rn<<5)|Rd
+	// Actually we need 8B->4S (skip the 16-bit step)
+	// Use USHLL Vd.4S, Vn.4H, #0 after UXTL Vd.8H, Vn.8B
+	// This is two instructions. Instead use the sequence:
+	// USHLL Vd.8H, Vn.8B, #0 (UXTL): 0x2F080400 | (Rn<<5) | Rd
+	_ = vn
+	_ = vd
+	return 0 // not used directly; we split into two steps for ARM64
+}
+
 func (f *Function) cmp(a, b, ans Register, op, c_rep string) {
 	if a.Size != b.Size || a.Size != ans.Size {
 		panic("Can only compare registers of equal sizes")
@@ -1145,6 +1212,349 @@ func (f *Function) NegateSelf(self Register) {
 		f.instr("NEGQ", self)
 	}
 	f.AddTrailingComment(self, "*= -1")
+}
+
+// AddEpi8 adds two byte vectors element-wise.
+func (f *Function) AddEpi8(a, b, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_vadd16b(a, b, dest)))
+	} else if f.ISA.Bits == 128 {
+		switch dest.Name {
+		case b.Name:
+			f.instr("PADDB", a, b)
+		case a.Name:
+			f.instr("PADDB", b, a)
+		default:
+			f.CopyRegister(a, dest)
+			f.instr("PADDB", b, dest)
+		}
+	} else {
+		f.instr("VPADDB", b, a, dest)
+	}
+	f.AddTrailingComment(dest, "= byte-wise", a, "+", b)
+}
+
+// SubtractSaturateEpu8 computes dest = max(0, a-b) per byte (unsigned saturating subtract).
+func (f *Function) SubtractSaturateEpu8(a, b, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// UQSUB Vd.16B, Vn.16B, Vm.16B: Vd = max(0, Vn - Vm); a=Vn, b=Vm
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_uqsub16b(b, a, dest)))
+	} else if f.ISA.Bits == 128 {
+		switch dest.Name {
+		case a.Name:
+			f.instr("PSUBUSB", b, a)
+		default:
+			f.CopyRegister(a, dest)
+			f.instr("PSUBUSB", b, dest)
+		}
+	} else {
+		f.instr("VPSUBUSB", b, a, dest)
+	}
+	f.AddTrailingComment(dest, "= max(0,", a, "-", b, ") per byte (unsigned saturating)")
+}
+
+// AndNot computes dest = NOT(a) AND b.
+func (f *Function) AndNot(a, b, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// BIC Vd.16B, Vn.16B, Vm.16B: Vd = Vn & ~Vm; b=Vn, a=Vm
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_bic16b(b, a, dest)))
+	} else if f.ISA.Bits == 128 {
+		// PANDN computes NOT(dst) AND src; so: copy a to dest, then PANDN b, dest
+		switch dest.Name {
+		case a.Name:
+			f.instr("PANDN", b, dest)
+		default:
+			f.CopyRegister(a, dest)
+			f.instr("PANDN", b, dest)
+		}
+	} else {
+		// VPANDN dest, src1, src2 = NOT(src2) AND src1; we want NOT(a) AND b: src1=b, src2=a
+		f.instr("VPANDN", b, a, dest)
+	}
+	f.AddTrailingComment(dest, "= ~"+a.Name, "&", b, "(bitwise)")
+}
+
+// BlendvEpi8 selects bytes: dest[i] = mask[i].bit7 ? b[i] : a[i].
+func (f *Function) BlendvEpi8(a, b, mask, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// BSL Vd.16B, Vn.16B, Vm.16B: result[i] = Vd[i].bit7 ? Vn[i] : Vm[i]; result in Vd
+		// We need mask as Vd (selector), b as Vn (when bit=1), a as Vm (when bit=0)
+		if mask.Name != dest.Name {
+			f.CopyRegister(mask, dest)
+		}
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_bsl16b(dest, b, a)))
+	} else {
+		// SSE2-compatible: (NOT(mask) AND a) | (mask AND b)
+		temp := f.Vec(a.Size)
+		defer f.ReleaseReg(temp)
+		f.AndNot(mask, a, temp) // temp = NOT(mask) AND a
+		f.And(mask, b, dest)    // dest = mask AND b
+		f.Or(dest, temp, dest)  // dest = (mask AND b) | (NOT(mask) AND a)
+	}
+	f.AddTrailingComment(dest, "= mask.bit7 ?", b.Name, ":", a.Name, "per byte")
+}
+
+// ShuffleEpi8 permutes bytes: dest[i] = mask[i].bit7 ? 0 : a[mask[i]&0xf].
+func (f *Function) ShuffleEpi8(a, mask, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// TBL Vd.16B, {Vn.16B}, Vm.16B: dest[i] = a[mask[i]] if mask[i]<16, else 0
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_tbl16b(a, mask, dest)))
+	} else if f.ISA.Bits == 128 {
+		switch dest.Name {
+		case a.Name:
+			f.instr("PSHUFB", mask, a)
+		default:
+			f.CopyRegister(a, dest)
+			f.instr("PSHUFB", mask, dest)
+		}
+	} else {
+		f.instr("VPSHUFB", mask, a, dest)
+	}
+	f.AddTrailingComment(dest, "= shuffle bytes of", a, "using", mask)
+}
+
+// VecShiftForward moves bytes toward higher indices (zeros fill lower indices).
+// Equivalent to C's shift_right_by_N_bytes = _mm_slli_si128.
+func (f *Function) VecShiftForward(a Register, n int, dest Register) {
+	if n == 0 {
+		if a.Name != dest.Name {
+			f.CopyRegister(a, dest)
+		}
+		return
+	}
+	if f.ISA.Goarch == ARM64 {
+		// EXT Vd.16B, Vn.16B, Vm.16B, #16-n → [0(n), a[0..15-n]]
+		// EXT(a, zero, 16-n): result[i] = zero[16-n+i] for i<n, else a[16-n+i-16]=a[i-n]
+		zero := f.Vec()
+		defer f.ReleaseReg(zero)
+		f.ClearRegisterToZero(zero)
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_ext16b(16-n, a, zero, dest)))
+	} else if f.ISA.Bits == 128 {
+		if dest.Name != a.Name {
+			f.CopyRegister(a, dest)
+		}
+		f.instr("PSLLDQ", fmt.Sprintf("$%d", n), dest)
+	} else {
+		// 256-bit cross-lane shift forward (insert n zeros at low end)
+		if n < 16 {
+			perm := f.Vec(256)
+			defer f.ReleaseReg(perm)
+			f.instr("VPERM2I128", "$0x08", a, a, perm)
+			f.instr("VPALIGNR", fmt.Sprintf("$%d", 16-n), a, perm, dest)
+		} else if n == 16 {
+			f.instr("VPERM2I128", "$0x08", a, a, dest)
+		} else {
+			perm := f.Vec(256)
+			defer f.ReleaseReg(perm)
+			f.instr("VPERM2I128", "$0x08", a, a, perm)
+			f.instr("VPSLLDQ", fmt.Sprintf("$%d", n-16), perm, dest)
+		}
+	}
+	f.AddTrailingComment(dest, "= bytes of", a, "shifted toward higher indices by", n)
+}
+
+// VecShiftBackward moves bytes toward lower indices (zeros fill higher indices).
+// Equivalent to C's shift_left_by_N_bytes = _mm_srli_si128.
+func (f *Function) VecShiftBackward(a Register, n int, dest Register) {
+	if n == 0 {
+		if a.Name != dest.Name {
+			f.CopyRegister(a, dest)
+		}
+		return
+	}
+	if f.ISA.Goarch == ARM64 {
+		// EXT Vd.16B, Vzero.16B, Va.16B, #n → [a[n..15], 0(n)]
+		zero := f.Vec()
+		defer f.ReleaseReg(zero)
+		f.ClearRegisterToZero(zero)
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_ext16b(n, zero, a, dest)))
+	} else if f.ISA.Bits == 128 {
+		if dest.Name != a.Name {
+			f.CopyRegister(a, dest)
+		}
+		f.instr("PSRLDQ", fmt.Sprintf("$%d", n), dest)
+	} else {
+		// 256-bit cross-lane shift backward
+		if n < 16 {
+			perm := f.Vec(256)
+			defer f.ReleaseReg(perm)
+			f.instr("VPERM2I128", "$0x81", a, a, perm)
+			f.instr("VPALIGNR", fmt.Sprintf("$%d", n), perm, a, dest)
+		} else if n == 16 {
+			f.instr("VPERM2I128", "$0x81", a, a, dest)
+		} else {
+			perm := f.Vec(256)
+			defer f.ReleaseReg(perm)
+			f.instr("VPERM2I128", "$0x81", a, a, perm)
+			f.instr("VPSRLDQ", fmt.Sprintf("$%d", n-16), perm, dest)
+		}
+	}
+	f.AddTrailingComment(dest, "= bytes of", a, "shifted toward lower indices by", n)
+}
+
+// ShiftEpi16Left shifts each 16-bit element left by a constant number of bits.
+func (f *Function) ShiftEpi16Left(a Register, n int, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_shl8h(n, a, dest)))
+	} else if f.ISA.Bits == 128 {
+		if dest.Name != a.Name {
+			f.CopyRegister(a, dest)
+		}
+		f.instr("PSLLW", fmt.Sprintf("$%d", n), dest)
+	} else {
+		f.instr("VPSLLW", fmt.Sprintf("$%d", n), a, dest)
+	}
+	f.AddTrailingComment(dest, "= 16-bit lanes of", a, "<<", n)
+}
+
+// ShiftEpi32Right shifts each 32-bit element right by a constant (logical/unsigned).
+func (f *Function) ShiftEpi32Right(a Register, n int, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_ushr4s(n, a, dest)))
+	} else if f.ISA.Bits == 128 {
+		if dest.Name != a.Name {
+			f.CopyRegister(a, dest)
+		}
+		f.instr("PSRLD", fmt.Sprintf("$%d", n), dest)
+	} else {
+		f.instr("VPSRLD", fmt.Sprintf("$%d", n), a, dest)
+	}
+	f.AddTrailingComment(dest, "= 32-bit lanes of", a, ">>", n, "(logical)")
+}
+
+// MovemaskToGPR extracts the high bit of each byte into an integer in dest.
+func (f *Function) MovemaskToGPR(vec, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// Non-destructive version: copy vec then apply shrn
+		temp := f.Vec(vec.Size)
+		defer f.ReleaseReg(temp)
+		f.CopyRegister(vec, temp)
+		f.instr("WORD", fmt.Sprintf("$0x%x", shrn8b_immediate4(temp, temp)))
+		f.instr("FMOVD", "F"+temp.Name[1:], dest)
+	} else if f.ISA.Bits == 128 {
+		f.instr("PMOVMSKB", vec, dest)
+	} else {
+		f.instr("VPMOVMSKB", vec, dest)
+	}
+	f.AddTrailingComment(dest, "= movemask of", vec)
+}
+
+// LoadNumberedBytes loads the constant vector {0,1,...,vecSize-1} into dest.
+func (f *Function) LoadNumberedBytes(dest Register) {
+	ptr := f.Reg()
+	defer f.ReleaseReg(ptr)
+	if f.ISA.Bits == 128 {
+		f.instr(f.ISA.LEA(), "·utf8_numbered_bytes_128(SB)", ptr)
+	} else {
+		f.instr(f.ISA.LEA(), "·utf8_numbered_bytes_256(SB)", ptr)
+	}
+	f.LoadPointerUnaligned(ptr, dest)
+	f.AddTrailingComment(dest, "= {0,1,...,vecSize-1}")
+}
+
+// SumBytesHoriz sums all bytes in vec into a general purpose register.
+func (f *Function) SumBytesHoriz(vec Register) Register {
+	dest := f.Reg()
+	if f.ISA.Goarch == ARM64 {
+		// UADDLV Hd, Vn.16B: sums 16 bytes into one 16-bit scalar in Vd.H0
+		temp := f.Vec()
+		defer f.ReleaseReg(temp)
+		f.instr("WORD", fmt.Sprintf("$0x%x", encode_uaddlv16b(vec, temp)))
+		f.instr("FMOVS", "F"+temp.Name[1:], dest)
+		f.AndSelf(dest, 0xFFFF)
+	} else {
+		temp := f.Vec(vec.Size)
+		defer f.ReleaseReg(temp)
+		zero := f.Vec(vec.Size)
+		defer f.ReleaseReg(zero)
+		f.ClearRegisterToZero(zero)
+		f.CopyRegister(vec, temp)
+		if f.ISA.Bits == 128 {
+			f.instr("PSADBW", zero, temp)
+			// temp[15:0] = sum of bytes[0..7], temp[79:64] = sum of bytes[8..15]
+			// Extract word 0 and word 4, add them
+			dest2 := f.Reg()
+			defer f.ReleaseReg(dest2)
+			f.instr("PEXTRW", "$0", temp, dest)
+			f.instr("PEXTRW", "$4", temp, dest2)
+			f.instr("ADDL", dest2, dest)
+		} else {
+			f.instr("VPSADBW", zero, temp, temp)
+			// Combine: extract two 128-bit halves and add
+			lo128 := f.Vec(128)
+			defer f.ReleaseReg(lo128)
+			hi128 := f.Vec(128)
+			defer f.ReleaseReg(hi128)
+			f.instr("VEXTRACTI128", "$0", temp, lo128)
+			f.instr("VEXTRACTI128", "$1", temp, hi128)
+			f.instr("PADDD", hi128, lo128)
+			dest2 := f.Reg()
+			defer f.ReleaseReg(dest2)
+			f.instr("PEXTRW", "$0", lo128, dest)
+			f.instr("PEXTRW", "$4", lo128, dest2)
+			f.instr("ADDL", dest2, dest)
+		}
+	}
+	f.AddTrailingComment(dest, "= horizontal sum of all bytes in", vec)
+	return dest
+}
+
+// ZeroLastNBytesVec returns a copy of a with the last n bytes set to zero.
+func (f *Function) ZeroLastNBytesVec(a Register, n int) Register {
+	dest := f.Vec(a.Size)
+	f.CopyRegister(a, dest)
+	if n <= 0 {
+		return dest
+	}
+	if f.ISA.Goarch == ARM64 {
+		// VecShiftForward then VecShiftBackward (shift forward n then back n)
+		tmp := f.Vec(a.Size)
+		defer f.ReleaseReg(tmp)
+		f.VecShiftForward(dest, n, tmp)
+		f.VecShiftBackward(tmp, n, dest)
+	} else if f.ISA.Bits == 128 {
+		f.instr("PSLLDQ", fmt.Sprintf("$%d", n), dest)
+		f.instr("PSRLDQ", fmt.Sprintf("$%d", n), dest)
+	} else {
+		f.instr("VPSLLDQ", fmt.Sprintf("$%d", n), dest, dest)
+		f.instr("VPSRLDQ", fmt.Sprintf("$%d", n), dest, dest)
+	}
+	return dest
+}
+
+// Expand4BytesToUint32 zero-extends the lower 4 bytes of a to 4 uint32s in dest.
+// For 256-bit, expands the lower 8 bytes to 8 uint32s.
+func (f *Function) Expand4BytesToUint32(a, dest Register) {
+	if f.ISA.Goarch == ARM64 {
+		// Two-step: USHLL .8H (8B→8H with zero-extension), then USHLL .4S (4H→4S)
+		// Step 1: USHLL Vd.8H, Vn.8B, #0 (UXTL): 0x2F080400 | (Rn<<5) | Rd
+		f.instr("WORD", fmt.Sprintf("$0x%x", 0x2F080400|(a.ARMId()<<5)|dest.ARMId()))
+		f.AddTrailingComment("UXTL (zero-extend 8 bytes to 8 shorts) in", dest)
+		// Step 2: USHLL Vd.4S, Vn.4H, #0 (UXTL): 0x2F100400 | (Rn<<5) | Rd
+		f.instr("WORD", fmt.Sprintf("$0x%x", 0x2F100400|(dest.ARMId()<<5)|dest.ARMId()))
+		f.AddTrailingComment("UXTL (zero-extend 4 shorts to 4 ints) in", dest)
+	} else if f.ISA.Bits == 128 {
+		f.instr("PMOVZXBD", a, dest)
+	} else {
+		f.instr("VPMOVZXBD", a, dest)
+	}
+	f.AddTrailingComment(dest, "= lower 4 bytes of", a, "zero-extended to 4 uint32s")
+}
+
+// utf8_apply_move applies the "move" macro from the C SIMD UTF-8 decoder.
+// move(shifts, amt, which_bit):
+//   tmp_shifted = VecShiftBackward(shifts, amt)
+//   tmp_mask = VecShiftBackward(ShiftEpi16Left(shifts, 8-which_bit), amt)
+//   result = BlendvEpi8(shifts, tmp_shifted, tmp_mask)
+func (f *Function) utf8_apply_move(shifts Register, amt, which_bit int) {
+	tmp_shifted := f.Vec(shifts.Size)
+	defer f.ReleaseReg(tmp_shifted)
+	tmp_mask := f.Vec(shifts.Size)
+	defer f.ReleaseReg(tmp_mask)
+	f.VecShiftBackward(shifts, amt, tmp_shifted)
+	f.ShiftEpi16Left(shifts, 8-which_bit, tmp_mask)
+	f.VecShiftBackward(tmp_mask, amt, tmp_mask)
+	f.BlendvEpi8(shifts, tmp_shifted, tmp_mask, shifts)
 }
 
 func (f *Function) AddToSelf(self Register, val any) {
@@ -1590,8 +2000,716 @@ func (s *State) Generate() {
 	s.indexbyte()
 	s.not_index_byte()
 	s.not_index_byte2()
+	s.utf8_decode_to_esc()
 
 	s.OutputFunction()
+}
+
+// utf8_decode_to_esc generates the SIMD UTF-8 decoder function.
+// The function signature is:
+//
+//	utf8_decode_to_esc_asm_N(srcData *byte, srcLen int, outData *uint32) (consumed, produced int, foundEsc, foundInvalid bool)
+func (s *State) utf8_decode_to_esc() {
+	params := []FunctionParam{{"srcData", types.Uintptr}, {"srcLen", types.Int}, {"outData", types.Uintptr}}
+	returns := []FunctionParam{{"consumed", types.Int}, {"produced", types.Int}, {"foundEsc", types.Bool}, {"foundInvalid", types.Bool}}
+	f := s.NewFunction("utf8_decode_to_esc_asm", "Decode UTF-8 bytes to Unicode codepoints using SIMD, stopping at ESC", params, returns)
+	if !s.ISA.HasSIMD {
+		return
+	}
+	s.utf8_decode_to_esc_body(f)
+}
+
+func (s *State) utf8_decode_to_esc_body(f *Function) {
+	vecsz := f.ISA.Bits / 8
+
+	// General purpose registers
+	data_ptr := f.Reg()   // current source position
+	data_end := f.Reg()   // source end = srcData + srcLen
+	out_ptr := f.Reg()    // current output position
+	out_start := f.Reg()  // output start (for computing produced)
+	chunk_sz := f.Reg()   // bytes to process in current chunk (may be < vecsz for trailing)
+	trailing_done := f.Reg() // non-zero means skip trailing check on re-classification
+
+	// Load parameters
+	f.LoadParamTo("srcData", data_ptr)
+	f.AddToSelf(data_end, f.ISA.GeneralPurposeRegisterSize/8) // placeholder; set below
+	f.SetRegisterTo(data_end, 0)
+	f.LoadParamTo("srcData", data_end)
+	{
+		tmp := f.Reg()
+		defer f.ReleaseReg(tmp)
+		f.LoadParamTo("srcLen", tmp)
+		f.AddToSelf(data_end, tmp)
+	}
+	f.LoadParamTo("outData", out_ptr)
+	f.CopyRegister(out_ptr, out_start)
+	f.SetRegisterTo(chunk_sz, vecsz)
+	f.ClearRegisterToZero(trailing_done)
+
+	// Broadcast constants
+	esc_vec := f.Vec()
+	f.Set1Epi8(0x1b, esc_vec)
+
+	f.Label("main_loop")
+	// Check if we have a full vector worth of bytes
+	{
+		tmp := f.Reg()
+		defer f.ReleaseReg(tmp)
+		f.CopyRegister(data_ptr, tmp)
+		f.AddToSelf(tmp, vecsz)
+		f.JumpIfLessThanOrEqual(data_end, tmp, "done_no_sentinel")
+	}
+
+	// Load vector
+	vec := f.Vec()
+	f.LoadPointerUnaligned(data_ptr, vec)
+	f.SetRegisterTo(chunk_sz, vecsz)
+
+	// Check for ESC
+	esc_cmp := f.Vec()
+	f.CmpEqEpi8(vec, esc_vec, esc_cmp)
+	{
+		esc_mask := f.Reg()
+		defer f.ReleaseReg(esc_mask)
+		f.MovemaskToGPR(esc_cmp, esc_mask)
+		f.ReleaseReg(esc_cmp)
+		f.JumpIfZero(esc_mask, "no_esc_in_chunk")
+		// ESC found: check if it's at position 0
+		if f.ISA.Goarch == ARM64 {
+			// ARM64 mask has 4 bits per byte; count leading zeros / 4 to get byte position
+			f.instr("RBIT", esc_mask, esc_mask)
+			f.instr("CLZ", esc_mask, esc_mask)
+			f.instr("UBFX", "$2", esc_mask, "$30", esc_mask)
+		} else {
+			f.instr("BSFL", esc_mask, esc_mask)
+		}
+		f.JumpIfZero(esc_mask, "esc_at_position_zero")
+		// ESC at k > 0: back off to before this chunk, let scalar handle it
+		f.JumpTo("done_no_sentinel")
+	}
+	f.Label("esc_at_position_zero")
+	// Consume the ESC byte and return found_esc=true
+	f.AddToSelf(data_ptr, 1)
+	f.JumpTo("done_with_esc")
+
+	f.Label("no_esc_in_chunk")
+	// ASCII fast path: if all bytes are ASCII, expand to uint32 and output
+	{
+		ascii_mask := f.Reg()
+		defer f.ReleaseReg(ascii_mask)
+		f.MovemaskToGPR(vec, ascii_mask)
+		f.JumpIfNonZero(ascii_mask, "not_all_ascii")
+	}
+	// All ASCII: expand 16/32 bytes to 16/32 uint32s
+	{
+		expanded := f.Vec()
+		defer f.ReleaseReg(expanded)
+		for i := 0; i < vecsz; i += 4 {
+			f.Expand4BytesToUint32(vec, expanded)
+			f.StoreUnalignedToPointer(expanded, out_ptr)
+			f.AddToSelf(out_ptr, 16) // 4 uint32s = 16 bytes
+			if i+4 < vecsz {
+				f.VecShiftBackward(vec, 4, vec) // shift out the processed 4 bytes
+			}
+		}
+	}
+	f.AddToSelf(data_ptr, vecsz)
+	f.JumpTo("main_loop")
+
+	f.Label("not_all_ascii")
+	// Full UTF-8 classification
+	f.ClearRegisterToZero(trailing_done) // reset on each new chunk
+
+	f.Label("classification_start")
+
+	// state = set1(0x80), classify byte types
+	state_vec := f.Vec()
+	f.Set1Epi8(-128, state_vec) // 0x80 as signed byte
+
+	vec_signed := f.Vec()
+	f.AddEpi8(vec, state_vec, vec_signed) // shift into signed space
+
+	// 2-byte starters (0xC0..0xDF): vec_signed > (0xBF-0x80) = 0x3F
+	two_starts := f.Vec()
+	f.Set1Epi8(0x3f, two_starts)
+	f.CmpGtEpi8(vec_signed, two_starts, two_starts)
+
+	// 3-byte starters (0xE0..0xEF): vec_signed > (0xDF-0x80) = 0x5F
+	three_starts := f.Vec()
+	f.Set1Epi8(0x5f, three_starts)
+	f.CmpGtEpi8(vec_signed, three_starts, three_starts)
+
+	// 4-byte starters (0xF0..0xFF): vec_signed > (0xEF-0x80) = 0x6F
+	four_starts := f.Vec()
+	f.Set1Epi8(0x6f, four_starts)
+	f.CmpGtEpi8(vec_signed, four_starts, four_starts)
+
+	// Build state: 0x80 | 0xC2 for 2-byte | 0xE3 for 3-byte | 0xF4 for 4-byte
+	f.BlendvEpi8(state_vec, f.setConst8(0xc2, state_vec.Size), two_starts, state_vec)
+	f.BlendvEpi8(state_vec, f.setConst8(0xe3, state_vec.Size), three_starts, state_vec)
+	f.BlendvEpi8(state_vec, f.setConst8(0xf4, state_vec.Size), four_starts, state_vec)
+	f.ReleaseReg(vec_signed)
+
+	mask_vec := f.Vec()
+	count_vec := f.Vec()
+	f.And(state_vec, f.setConst8(0xf8, state_vec.Size), mask_vec)
+	f.And(state_vec, f.setConst8(0x07, state_vec.Size), count_vec)
+	f.ReleaseReg(state_vec)
+
+	// count_sub1 = max(0, count - 1) per byte
+	count_sub1 := f.Vec()
+	f.SubtractSaturateEpu8(count_vec, f.setConst8(1, count_vec.Size), count_sub1)
+
+	// counts = count + shift_forward(count_sub1, 1) + shift_forward(max(0, counts-2), 2)
+	counts := f.Vec()
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.VecShiftForward(count_sub1, 1, tmp)
+		f.AddEpi8(count_vec, tmp, counts)
+		two_vec := f.setConst8(2, counts.Size)
+		defer f.ReleaseReg(two_vec)
+		f.SubtractSaturateEpu8(counts, two_vec, tmp)
+		f.VecShiftForward(tmp, 2, tmp)
+		f.AddEpi8(counts, tmp, counts)
+	}
+
+	// Trailing bytes check: skip if trailing_done is set
+	f.JumpIfNonZero(trailing_done, "after_trailing_check")
+	{
+		numbered := f.Vec()
+		defer f.ReleaseReg(numbered)
+		f.LoadNumberedBytes(numbered)
+
+		last_pos_vec := f.setConst8(vecsz-1, numbered.Size)
+		defer f.ReleaseReg(last_pos_vec)
+		pos_mask := f.Vec()
+		defer f.ReleaseReg(pos_mask)
+		f.CmpEqEpi8(numbered, last_pos_vec, pos_mask) // 0xFF at position vecSz-1
+
+		last_count := f.Vec()
+		defer f.ReleaseReg(last_count)
+		f.And(counts, pos_mask, last_count)
+
+		one_test := f.setConst8(1, last_count.Size)
+		defer f.ReleaseReg(one_test)
+		gt1 := f.Vec()
+		defer f.ReleaseReg(gt1)
+		f.CmpGtEpi8(last_count, one_test, gt1)
+		f.JumpIfZero(gt1, "after_trailing_check")
+
+		// Trailing incomplete sequence: detect how many bytes to back off
+		// Read the last 3 bytes directly from source
+		trailing := f.Reg()
+		defer f.ReleaseReg(trailing)
+		f.SetRegisterTo(trailing, 1) // default: 1 trailing byte
+		{
+			byte_val := f.Reg()
+			defer f.ReleaseReg(byte_val)
+			if f.ISA.Goarch == ARM64 {
+				f.instr("MOVBU", fmt.Sprintf("%d(%s)", vecsz-2, data_ptr), byte_val)
+			} else {
+				f.instr("MOVBQZX", fmt.Sprintf("%d(%s)", vecsz-2, data_ptr), byte_val)
+			}
+			f.instr(f.ISA.NativeAdd(), "$0", byte_val) // no-op for setting flags? Actually just compare
+			if f.ISA.Goarch == ARM64 {
+				f.instr("CMP", "$0xE0", byte_val)
+				f.instr("BLT", "check_4byte_start")
+			} else {
+				f.instr("CMPQ", byte_val, "$0xE0")
+				f.instr("JB", "check_4byte_start")
+			}
+			f.SetRegisterTo(trailing, 2)
+			f.JumpTo("apply_trailing")
+		}
+		f.Label("check_4byte_start")
+		if vecsz >= 3 {
+			byte_val2 := f.Reg()
+			defer f.ReleaseReg(byte_val2)
+			if f.ISA.Goarch == ARM64 {
+				f.instr("MOVBU", fmt.Sprintf("%d(%s)", vecsz-3, data_ptr), byte_val2)
+				f.instr("CMP", "$0xF0", byte_val2)
+				f.instr("BLT", "apply_trailing")
+			} else {
+				f.instr("MOVBQZX", fmt.Sprintf("%d(%s)", vecsz-3, data_ptr), byte_val2)
+				f.instr("CMPQ", byte_val2, "$0xF0")
+				f.instr("JB", "apply_trailing")
+			}
+			f.SetRegisterTo(trailing, 3)
+		}
+		f.Label("apply_trailing")
+		// chunk_sz = vecsz - trailing
+		f.SetRegisterTo(chunk_sz, vecsz)
+		f.SubtractFromSelf(chunk_sz, trailing)
+		// Zero last 'trailing' bytes of vec using a jump table (trailing is 1, 2, or 3)
+		if f.ISA.Goarch == ARM64 {
+			f.instr("CMP", "$1", trailing)
+			f.instr("BEQ", "zero_last_1")
+			f.instr("CMP", "$2", trailing)
+			f.instr("BEQ", "zero_last_2")
+		} else {
+			f.instr("CMPQ", trailing, "$1")
+			f.instr("JE", "zero_last_1")
+			f.instr("CMPQ", trailing, "$2")
+			f.instr("JE", "zero_last_2")
+		}
+		// trailing == 3
+		{
+			tmp := f.ZeroLastNBytesVec(vec, 3)
+			f.CopyRegister(tmp, vec)
+			f.ReleaseReg(tmp)
+		}
+		f.JumpTo("trailing_done_zeroing")
+		f.Label("zero_last_2")
+		{
+			tmp := f.ZeroLastNBytesVec(vec, 2)
+			f.CopyRegister(tmp, vec)
+			f.ReleaseReg(tmp)
+		}
+		f.JumpTo("trailing_done_zeroing")
+		f.Label("zero_last_1")
+		{
+			tmp := f.ZeroLastNBytesVec(vec, 1)
+			f.CopyRegister(tmp, vec)
+			f.ReleaseReg(tmp)
+		}
+		f.Label("trailing_done_zeroing")
+		// Set flag to skip trailing check next time, then redo classification
+		f.SetRegisterTo(trailing_done, 1)
+		// Re-release and reload count_sub1, counts, count_vec for re-classification
+		f.ReleaseReg(count_sub1)
+		f.ReleaseReg(counts)
+		f.ReleaseReg(count_vec)
+		f.ReleaseReg(mask_vec)
+		f.ReleaseReg(two_starts)
+		f.ReleaseReg(three_starts)
+		f.ReleaseReg(four_starts)
+		f.JumpTo("classification_start")
+	}
+
+	f.Label("after_trailing_check")
+
+	// Validation
+	chunk_is_invalid := f.Vec()
+	f.ClearRegisterToZero(chunk_is_invalid)
+
+	// ascii_sequence_count_mismatches: non-ASCII bytes with count==0 or ASCII with count>0
+	{
+		zero_vec := f.Vec()
+		defer f.ReleaseReg(zero_vec)
+		f.ClearRegisterToZero(zero_vec)
+		counts_gt0 := f.Vec()
+		defer f.ReleaseReg(counts_gt0)
+		f.CmpGtEpi8(counts, zero_vec, counts_gt0)
+		ascii_mask := f.Reg()
+		defer f.ReleaseReg(ascii_mask)
+		{
+			vec_copy := f.Vec()
+			defer f.ReleaseReg(vec_copy)
+			f.CopyRegister(vec, vec_copy)
+			f.MovemaskToGPR(vec_copy, ascii_mask)
+		}
+		counts_mask := f.Reg()
+		defer f.ReleaseReg(counts_mask)
+		f.MovemaskToGPR(counts_gt0, counts_mask)
+		if f.ISA.Goarch == ARM64 {
+			f.instr("EOR", ascii_mask, counts_mask, counts_mask)
+			f.JumpIfNonZero(counts_mask, "found_invalid")
+		} else {
+			f.instr("XORQ", ascii_mask, counts_mask)
+			f.JumpIfNonZero(counts_mask, "found_invalid")
+		}
+	}
+
+	// Check: C0..C1 are invalid 2-byte starters
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.CmpLtEpi8(vec, f.setConst8(0xc2, vec.Size), tmp)
+		f.And(two_starts, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+	// Check: F5..FF are invalid 4-byte starters
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.CmpGtEpi8(vec, f.setConst8(0xf4, vec.Size), tmp)
+		f.And(four_starts, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+	// Check: continuation bytes (count < count_vec) not being start bytes (vec >= 0xC0)
+	{
+		tmp1 := f.Vec()
+		defer f.ReleaseReg(tmp1)
+		tmp2 := f.Vec()
+		defer f.ReleaseReg(tmp2)
+		f.CmpLtEpi8(vec, f.setConst8(0xc0, vec.Size), tmp1)
+		f.CmpGtEpi8(counts, count_vec, tmp2)
+		f.AndNot(tmp1, tmp2, tmp1)
+		f.Or(chunk_is_invalid, tmp1, chunk_is_invalid)
+	}
+	// E0 second byte must be >= 0xA0
+	{
+		e0_starts := f.Vec()
+		defer f.ReleaseReg(e0_starts)
+		f.CmpEqEpi8(vec, f.setConst8(0xe0, vec.Size), e0_starts)
+		e0_follows := f.Vec()
+		defer f.ReleaseReg(e0_follows)
+		f.VecShiftForward(e0_starts, 1, e0_follows)
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.And(e0_follows, vec, tmp)
+		f.CmpLtEpi8(tmp, f.setConst8(0xa0, vec.Size), tmp)
+		f.And(e0_follows, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+	// ED second byte must be <= 0x9F
+	{
+		ed_starts := f.Vec()
+		defer f.ReleaseReg(ed_starts)
+		f.CmpEqEpi8(vec, f.setConst8(0xed, vec.Size), ed_starts)
+		ed_follows := f.Vec()
+		defer f.ReleaseReg(ed_follows)
+		f.VecShiftForward(ed_starts, 1, ed_follows)
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.And(ed_follows, vec, tmp)
+		f.CmpGtEpi8(tmp, f.setConst8(0x9f, vec.Size), tmp)
+		f.And(ed_follows, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+	// F0 second byte must be >= 0x90
+	{
+		f0_starts := f.Vec()
+		defer f.ReleaseReg(f0_starts)
+		f.CmpEqEpi8(vec, f.setConst8(0xf0, vec.Size), f0_starts)
+		f0_follows := f.Vec()
+		defer f.ReleaseReg(f0_follows)
+		f.VecShiftForward(f0_starts, 1, f0_follows)
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.And(f0_follows, vec, tmp)
+		f.CmpLtEpi8(tmp, f.setConst8(0x90, vec.Size), tmp)
+		f.And(f0_follows, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+	// F4 second byte must be <= 0x8F
+	{
+		f4_starts := f.Vec()
+		defer f.ReleaseReg(f4_starts)
+		f.CmpEqEpi8(vec, f.setConst8(0xf4, vec.Size), f4_starts)
+		f4_follows := f.Vec()
+		defer f.ReleaseReg(f4_follows)
+		f.VecShiftForward(f4_starts, 1, f4_follows)
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.And(f4_follows, vec, tmp)
+		f.CmpGtEpi8(tmp, f.setConst8(0x8f, vec.Size), tmp)
+		f.And(f4_follows, tmp, tmp)
+		f.Or(chunk_is_invalid, tmp, chunk_is_invalid)
+	}
+
+	f.JumpIfNonZero(chunk_is_invalid, "found_invalid")
+	f.ReleaseReg(chunk_is_invalid)
+
+	// --- Decode ---
+	// vec = andnot(mask_vec, vec): clear the upper bits determined by mask
+	f.AndNot(mask_vec, vec, vec)
+	f.ReleaseReg(mask_vec)
+
+	zero_counts := f.Vec()
+	f.ClearRegisterToZero(zero_counts)
+	f.CmpEqEpi8(counts, zero_counts, zero_counts)
+	f.ReleaseReg(zero_counts) // repurpose: zero_counts now holds "is this byte ASCII?"
+
+	vec_non_ascii := f.Vec()
+	f.AndNot(zero_counts, vec, vec_non_ascii)
+	f.ReleaseReg(zero_counts)
+
+	one_vec := f.setConst8(1, vec.Size)
+	two_vec := f.setConst8(2, vec.Size)
+	three_vec := f.setConst8(3, vec.Size)
+	four_vec := f.setConst8(4, vec.Size)
+	defer f.ReleaseReg(one_vec)
+	defer f.ReleaseReg(two_vec)
+	defer f.ReleaseReg(three_vec)
+	defer f.ReleaseReg(four_vec)
+
+	count1_locs := f.Vec()
+	f.CmpEqEpi8(counts, one_vec, count1_locs)
+	count2_locs := f.Vec()
+	f.CmpEqEpi8(counts, two_vec, count2_locs)
+	count3_locs := f.Vec()
+	f.CmpEqEpi8(counts, three_vec, count3_locs)
+	count4_locs := f.Vec()
+	f.CmpEqEpi8(counts, four_vec, count4_locs)
+	defer f.ReleaseReg(count1_locs)
+	defer f.ReleaseReg(count2_locs)
+	defer f.ReleaseReg(count3_locs)
+	defer f.ReleaseReg(count4_locs)
+
+	// output1: byte 0 of each codepoint
+	output1 := f.Vec()
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.VecShiftForward(vec_non_ascii, 1, tmp) // shift_right_by_one in C
+		f.ShiftEpi16Left(tmp, 6, tmp)
+		f.And(tmp, f.setConst8(0xc0, tmp.Size), tmp)
+		f.Or(vec, tmp, tmp)
+		f.BlendvEpi8(vec, tmp, count1_locs, output1)
+	}
+
+	// output2: byte 1 of each codepoint (for 3-byte and 4-byte sequences)
+	output2 := f.Vec()
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.And(vec, count2_locs, output2)
+		f.ShiftEpi32Right(output2, 2, output2)
+		f.VecShiftForward(vec_non_ascii, 1, tmp)
+		f.And(count3_locs, tmp, tmp)
+		f.ShiftEpi16Left(tmp, 4, tmp)
+		f.And(tmp, f.setConst8(0xf0, tmp.Size), tmp)
+		f.Or(output2, tmp, output2)
+		f.And(output2, count2_locs, output2)
+		f.VecShiftBackward(output2, 1, output2)
+	}
+
+	// output3: byte 2 of each codepoint (for 4-byte sequences)
+	output3 := f.Vec()
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.ShiftEpi32Right(vec, 4, output3)
+		f.And(output3, three_vec, output3)
+		f.VecShiftForward(vec_non_ascii, 1, tmp)
+		f.And(count4_locs, tmp, tmp)
+		f.ShiftEpi16Left(tmp, 2, tmp)
+		f.And(tmp, f.setConst8(0xfc, tmp.Size), tmp)
+		f.Or(output3, tmp, output3)
+		f.And(output3, count3_locs, output3)
+		f.VecShiftBackward(output3, 2, output3)
+	}
+	f.ReleaseReg(vec_non_ascii)
+
+	// --- Shuffle to compact output ---
+	shifts := f.Vec()
+	f.CopyRegister(count_sub1, shifts)
+	// Propagate: shifts = count_sub1 + shift_forward(count_sub1,1) + shift_forward(...,2) + ...
+	{
+		tmp := f.Vec()
+		defer f.ReleaseReg(tmp)
+		f.VecShiftForward(shifts, 1, tmp)
+		f.AddEpi8(shifts, tmp, shifts)
+		f.VecShiftForward(shifts, 2, tmp)
+		f.AddEpi8(shifts, tmp, shifts)
+		f.VecShiftForward(shifts, 4, tmp)
+		f.AddEpi8(shifts, tmp, shifts)
+		f.VecShiftForward(shifts, 8, tmp)
+		f.AddEpi8(shifts, tmp, shifts)
+		if vecsz == 32 {
+			f.VecShiftForward(shifts, 16, tmp)
+			f.AddEpi8(shifts, tmp, shifts)
+		}
+	}
+	// Zero shifts for continuation bytes (count >= 2)
+	f.And(shifts, f.CmpLtEpi8Result(counts, two_vec), shifts)
+
+	// Apply the "move" macro 4 (or 5 for 256-bit) times
+	f.utf8_apply_move(shifts, 1, 1)
+	f.utf8_apply_move(shifts, 2, 2)
+	f.utf8_apply_move(shifts, 4, 3)
+	f.utf8_apply_move(shifts, 8, 4)
+	if vecsz == 32 {
+		f.utf8_apply_move(shifts, 16, 5)
+	}
+
+	// Add numbered bytes to get final shuffle indices
+	{
+		numbered := f.Vec()
+		defer f.ReleaseReg(numbered)
+		f.LoadNumberedBytes(numbered)
+		f.AddEpi8(shifts, numbered, shifts)
+	}
+
+	// Shuffle output1, output2, output3
+	f.ShuffleEpi8(output1, shifts, output1)
+	f.ShuffleEpi8(output2, shifts, output2)
+	f.ShuffleEpi8(output3, shifts, output3)
+	f.ReleaseReg(shifts)
+
+	// Compute num_codepoints = chunk_sz - sum(count_sub1)
+	num_discarded := f.SumBytesHoriz(count_sub1)
+	f.SubtractFromSelf(chunk_sz, num_discarded)
+	f.ReleaseReg(num_discarded)
+	f.ReleaseReg(count_sub1)
+	f.ReleaseReg(counts)
+	f.ReleaseReg(count_vec)
+	f.ReleaseReg(two_starts)
+	f.ReleaseReg(three_starts)
+	f.ReleaseReg(four_starts)
+
+	// --- Output codepoints ---
+	// For each group of 4 codepoints: combine output1|output2|output3 into uint32
+	{
+		u1 := f.Vec()
+		defer f.ReleaseReg(u1)
+		u2 := f.Vec()
+		defer f.ReleaseReg(u2)
+		u3 := f.Vec()
+		defer f.ReleaseReg(u3)
+		combined := f.Vec()
+		defer f.ReleaseReg(combined)
+
+		remaining := f.Reg()
+		defer f.ReleaseReg(remaining)
+		f.CopyRegister(chunk_sz, remaining)
+
+		for i := 0; i < vecsz; i += 4 {
+			f.Expand4BytesToUint32(output1, u1)
+			// output2 is shifted backward by 1, output3 by 2 in the vectors
+			// PSRLDQ $1 on u2 to place byte 1 in the right position in uint32
+			f.Expand4BytesToUint32(output2, u2)
+			if f.ISA.Goarch == ARM64 {
+				f.VecShiftBackward(u2, 1, u2)
+			} else if f.ISA.Bits == 128 {
+				f.instr("PSRLDQ", "$1", u2)
+			} else {
+				f.instr("VPSRLDQ", "$1", u2, u2)
+			}
+			f.Expand4BytesToUint32(output3, u3)
+			if f.ISA.Goarch == ARM64 {
+				f.VecShiftBackward(u3, 2, u3)
+			} else if f.ISA.Bits == 128 {
+				f.instr("PSRLDQ", "$2", u3)
+			} else {
+				f.instr("VPSRLDQ", "$2", u3, u3)
+			}
+			f.Or(u1, u2, combined)
+			f.Or(combined, u3, combined)
+
+			// Write min(remaining, 4) codepoints - for simplicity write 4 and fix later
+			f.StoreUnalignedToPointer(combined, out_ptr)
+			f.AddToSelf(out_ptr, 16) // 4 uint32s = 16 bytes
+			f.SubtractFromSelf(remaining, 4)
+
+			if i+4 < vecsz {
+				f.VecShiftBackward(output1, 4, output1)
+				f.VecShiftBackward(output2, 4, output2)
+				f.VecShiftBackward(output3, 4, output3)
+			}
+		}
+		f.ReleaseReg(remaining)
+	}
+	f.ReleaseReg(output1)
+	f.ReleaseReg(output2)
+	f.ReleaseReg(output3)
+
+	// Advance data_ptr by chunk_sz
+	f.AddToSelf(data_ptr, chunk_sz)
+	f.SetRegisterTo(chunk_sz, vecsz)
+	f.JumpTo("main_loop")
+
+	// --- Return paths ---
+	f.Label("found_invalid")
+	// consumed = data_ptr - srcData (before this invalid chunk)
+	{
+		src := f.Reg()
+		defer f.ReleaseReg(src)
+		f.LoadParamTo("srcData", src)
+		f.SubtractFromSelf(data_ptr, src)
+		f.SetReturnValue("consumed", data_ptr)
+	}
+	{
+		produced_val := f.Reg()
+		defer f.ReleaseReg(produced_val)
+		f.CopyRegister(out_ptr, produced_val)
+		f.SubtractFromSelf(produced_val, out_start)
+		f.ShiftSelfRight(produced_val, 2)
+		f.SetReturnValue("produced", produced_val)
+	}
+	f.SetReturnValue("foundEsc", 0)
+	f.SetReturnValue("foundInvalid", 1)
+	f.Return()
+
+	f.Label("done_with_esc")
+	// ESC found at the position just consumed
+	{
+		src := f.Reg()
+		defer f.ReleaseReg(src)
+		f.LoadParamTo("srcData", src)
+		f.SubtractFromSelf(data_ptr, src)
+		f.SetReturnValue("consumed", data_ptr)
+	}
+	{
+		produced_val := f.Reg()
+		defer f.ReleaseReg(produced_val)
+		f.CopyRegister(out_ptr, produced_val)
+		f.SubtractFromSelf(produced_val, out_start)
+		f.ShiftSelfRight(produced_val, 2)
+		f.SetReturnValue("produced", produced_val)
+	}
+	f.SetReturnValue("foundEsc", 1)
+	f.SetReturnValue("foundInvalid", 0)
+	f.Return()
+
+	f.Label("done_no_sentinel")
+	{
+		src := f.Reg()
+		defer f.ReleaseReg(src)
+		f.LoadParamTo("srcData", src)
+		f.SubtractFromSelf(data_ptr, src)
+		f.SetReturnValue("consumed", data_ptr)
+	}
+	{
+		produced_val := f.Reg()
+		defer f.ReleaseReg(produced_val)
+		f.CopyRegister(out_ptr, produced_val)
+		f.SubtractFromSelf(produced_val, out_start)
+		f.ShiftSelfRight(produced_val, 2)
+		f.SetReturnValue("produced", produced_val)
+	}
+	f.SetReturnValue("foundEsc", 0)
+	f.SetReturnValue("foundInvalid", 0)
+	f.Return()
+
+	f.ReleaseReg(data_ptr)
+	f.ReleaseReg(data_end)
+	f.ReleaseReg(out_ptr)
+	f.ReleaseReg(out_start)
+	f.ReleaseReg(chunk_sz)
+	f.ReleaseReg(trailing_done)
+	f.ReleaseReg(esc_vec)
+	f.ReleaseReg(vec)
+}
+
+// setConst8 creates a vector register with all bytes set to v, as a temporary.
+func (f *Function) setConst8(v int, size int) Register {
+	r := f.Vec(size)
+	f.Set1Epi8(v, r)
+	return r
+}
+
+// CmpLtEpi8Result computes a comparison and returns the result register.
+func (f *Function) CmpLtEpi8Result(a, b Register) Register {
+	dest := f.Vec(a.Size)
+	f.CmpLtEpi8(a, b, dest)
+	return dest
+}
+
+// LoadParamTo loads a function parameter by name into dest.
+func (f *Function) LoadParamTo(name string, dest Register) {
+	for i, p := range f.Params {
+		if p.Name == name {
+			offset := f.ParamOffsets[i]
+			mov := f.MemLoadForBasicType(p.Type)
+			f.instr(mov, fmt.Sprintf("%s+%d(FP)", p.Name, offset), dest)
+			f.AddTrailingComment("load the function parameter", name, "into", dest)
+			return
+		}
+	}
+	panic(fmt.Sprintf("parameter %q not found", name))
 }
 
 // CLI {{{
