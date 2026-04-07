@@ -425,6 +425,7 @@ typedef struct _GLFWlibraryWayland
         struct xdg_toplevel_drag_v1 *toplevel_drag;
         struct xdg_surface *toplevel_xdg_surface;
         struct xdg_toplevel *toplevel_xdg_toplevel;
+        struct zxdg_toplevel_decoration_v1 *toplevel_decoration;
         struct wl_buffer *toplevel_buffer;
         struct {
             const char *mime_type;

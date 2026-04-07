@@ -3449,6 +3449,7 @@ _glfwPlatformFreeDragSourceData(void) {
     if (_glfw.wl.drag.drag_viewport) wp_viewport_destroy(_glfw.wl.drag.drag_viewport);
     if (_glfw.wl.drag.toplevel_drag) xdg_toplevel_drag_v1_destroy(_glfw.wl.drag.toplevel_drag);
     if (_glfw.wl.drag.toplevel_buffer) wl_buffer_destroy(_glfw.wl.drag.toplevel_buffer);
+    if (_glfw.wl.drag.toplevel_decoration) zxdg_toplevel_decoration_v1_destroy(_glfw.wl.drag.toplevel_decoration);
     if (_glfw.wl.drag.toplevel_xdg_toplevel) xdg_toplevel_destroy(_glfw.wl.drag.toplevel_xdg_toplevel);
     if (_glfw.wl.drag.toplevel_xdg_surface) xdg_surface_destroy(_glfw.wl.drag.toplevel_xdg_surface);
     if (_glfw.wl.drag.drag_icon) wl_surface_destroy(_glfw.wl.drag.drag_icon);
@@ -3531,6 +3532,17 @@ _glfwPlatformStartDrag(_GLFWwindow* window, const GLFWimage* thumbnail) {
                     _glfw.wl.drag.toplevel_xdg_surface);
             if (!_glfw.wl.drag.toplevel_xdg_toplevel) return ENOMEM;
             xdg_toplevel_add_listener(_glfw.wl.drag.toplevel_xdg_toplevel, &drag_toplevel_listener, NULL);
+            // Request client-side decorations to prevent the compositor from
+            // adding a title bar (SSD) that would shift the surface above the cursor.
+            if (_glfw.wl.decorationManager) {
+                _glfw.wl.drag.toplevel_decoration =
+                    zxdg_decoration_manager_v1_get_toplevel_decoration(
+                        _glfw.wl.decorationManager, _glfw.wl.drag.toplevel_xdg_toplevel);
+                if (_glfw.wl.drag.toplevel_decoration)
+                    zxdg_toplevel_decoration_v1_set_mode(
+                        _glfw.wl.drag.toplevel_decoration,
+                        ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+            }
             _glfw.wl.drag.toplevel_buffer = icon_buffer; icon_buffer = NULL;
             // Initial empty commit triggers the xdg_surface configure event.
             wl_surface_commit(_glfw.wl.drag.drag_icon);
